@@ -1,0 +1,146 @@
+# variables from apache/superset for services superset
+x-superset-user: &superset-user root
+x-superset-volumes: &superset-volumes
+  # /app/pythonpath_docker will be appended to the PYTHONPATH in the final container
+  - ./docker:/app/docker
+  #- ./superset:/app/superset
+  - ./superset-core:/app/superset-core
+  - ./docker/superset_config.py:/app/pythonpath/superset_config.py # mounting suprset-config so superset can recognize it
+
+
+
+services:
+  db:
+    container_name: postgres_container
+    image: postgres:14.17
+    ports:
+      - 5000:5432
+    environment:
+      POSTGRES_DB: db
+      POSTGRES_USER: db_user
+      POSTGRES_PASSWORD: db_password
+    volumes:
+      - /postgres/data:/var/lib/postgresql/data
+      # - postgres_data:/var/lib/postgresql/data 
+      - ./postgres:/docker-entrypoint-initdb.d
+      - ./postgres/airflow_init.sql:/docker-entrypoint-initdb.d/airflow_init.sql
+      - ./postgres/superset_init.sql:/docker-entrypoint-initdb.d/superset_init.sql
+    networks:
+      - my-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U db_user -d db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  af:
+    container_name: airflow_container
+    image: apache/airflow:3.0.0
+    ports: 
+    - 8000:8080
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@db:5432/airflow_db 
+      PYTHONPATH: /opt/airflow # to fix DAG error not found in airflow adding the pythonpath
+    volumes:
+     - ./airflow/dags:/opt/airflow/dags
+     - ./api-request:/opt/airflow/api_request
+     - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+     - '1001'
+    depends_on:
+     - db
+    networks:
+     - my-network
+    command: >
+      bash -c "airflow db migrate &&
+               airflow scheduler &
+               airflow api-server"
+    
+    
+    
+    #>
+    # bash -c "airflow db migrate && airflow standalone" 
+
+   
+
+  dbt:
+    container_name: dbt_container
+    image: ghcr.io/dbt-labs/dbt-postgres:1.9.latest # taken from fishtownanalytics/dbt -> dbt-postgres
+    volumes: 
+      - ./dbt/my_project:/usr/app
+      - ./dbt:/root/.dbt
+    working_dir: /usr/app
+    depends_on:
+      - db
+    networks:
+      - my-network
+    command: run
+
+  superset-init:
+    image: apache/superset:3.0.0-py310 # this superset version contains python packages that we need
+    container_name: superset_init
+    command: ["/app/docker/docker-init.sh"]
+    env_file:
+      - path: docker/.env # default
+        required: true
+    depends_on:
+      db:
+        condition: service_started
+      redis:
+        condition: service_started
+    user: *superset-user
+    volumes: *superset-volumes
+    environment:
+      SUPERSET_LOAD_EXAMPLES: "no"
+      SUPERSET_LOG_LEVEL: "{SUPERSET_LOG_LEVEL:-info}"
+      SUPERSET__SQLALCHEMY_EXAMPLES_URI: "duckdb:////app/data/examples.duckdb"
+      DATABASE_DB: "superset_db"
+    healthcheck:
+      disable: true
+    networks:
+      - my-network
+
+  superset:
+    env_file:
+      - path: docker/.env # default
+        required: true
+    image: apache/superset:3.0.0-py310
+    container_name: superset_app
+    command: ["/app/docker/docker-bootstrap.sh", "app"]
+    restart: unless-stopped
+    ports:
+      - 8088:8088
+    user: *superset-user
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+    volumes: *superset-volumes
+    environment:
+      SUPERSET_LOAD_EXAMPLES: "no"
+      DATABASE_DB: "superset_db"
+      SUPERSET__SQLALCHEMY_EXAMPLES_URI: "duckdb:////app/data/examples.duckdb"
+    networks:
+      - my-network
+
+
+
+  redis:
+    image: redis:7
+    container_name: superset_cache
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis:/data
+    networks:
+      - my-network
+
+
+
+networks:
+  my-network:
+    driver: bridge
+
+volumes:
+   redis:
+     external: false
